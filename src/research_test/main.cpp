@@ -1,10 +1,13 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <iostream>
 #include <memory.h>
-#include <winsock2.h>
-#include "pcap.h"
+#include <pcap.h>
 #include <string>
+#include <pthread.h>
+#include <csignal>
+
 
 using namespace std;
 
@@ -27,14 +30,13 @@ typedef struct pcaprec_hdr_s {
 
 bool g_doAbort = false;
 
-bool read_packet(pcaprec_hdr_t& packetHeader, uint8_t* packetData, uint32_t dataSizeMax, uint32_t& packetDataSize, FILE* fp)
-{
+bool read_packet(pcaprec_hdr_t& packetHeader, uint8_t* packetData, uint32_t dataSizeMax, uint32_t& packetDataSize, FILE* fp) {
 	size_t bytesRead = 0;
 	bytesRead = fread(&packetHeader, 1, sizeof(packetHeader), fp);
 	if (bytesRead == 0) {
 		return false;
 	} else if (bytesRead != sizeof(packetHeader)) {
-		printf("Error reading packet header! (%d != %d)\n", bytesRead, sizeof(packetHeader));
+		printf("Error reading packet header! (%zu != %zu)\n", bytesRead, sizeof(packetHeader));
 		return false;
 	}
 	if (packetHeader.incl_len > dataSizeMax) {
@@ -43,21 +45,20 @@ bool read_packet(pcaprec_hdr_t& packetHeader, uint8_t* packetData, uint32_t data
 	}
 	bytesRead = fread(packetData, 1, packetHeader.incl_len, fp);
 	if (bytesRead != packetHeader.incl_len) {
-		printf("Could only read %d bytes of the stated %d bytes in packet!\n", bytesRead, packetHeader.incl_len);
+		printf("Could only read %zu bytes of the stated %d bytes in packet!\n", bytesRead, packetHeader.incl_len);
 		return false;
 	}
 	packetDataSize = bytesRead;
 	return true;
 }
 
-bool openOutFile(char* baseFileName, FILE* outFile[], size_t channel, size_t ch, char* sourceName)
-{
+bool openOutFile(char* baseFileName, FILE* outFile[], size_t channel, size_t ch, char* sourceName) {
 	if (outFile[ch] == NULL) {
 		char fname[64] = {};
-		sprintf(fname, "%s_%s_%02d.wav", baseFileName, sourceName, channel);
+		sprintf(fname, "%s_%s_%02zu.wav", baseFileName, sourceName, channel);
 		outFile[ch] = fopen(fname, "wb+");
 		if (!outFile[ch]) {
-			printf("Failed to open output file '%s': %d\n", fname, errno);
+			printf("Failed to open output file '%s': %d\n", fname, !outFile[ch]);
 			return false;
 		}
 		uint32_t temp32 = 0;
@@ -94,16 +95,14 @@ bool openOutFile(char* baseFileName, FILE* outFile[], size_t channel, size_t ch,
 	return true;
 }
 
-uint8_t reverse(uint8_t b)
-{
+uint8_t reverse(uint8_t b) {
 	b = (b & 0xf0) >> 4 | (b & 0x0f) << 4;
 	//b = (b & 0xcc) >> 2 | (b & 0x33) << 2;
 	//b = (b & 0xaa) >> 1 | (b & 0x55) << 1;
 	return b;
 }
 
-uint32_t switchByteOrder24(uint32_t src)
-{
+uint32_t switchByteOrder24(uint32_t src) {
 	// Switch byte 0 and 2
 	src = (src & 0xff0000) >> 16 | (src & 0x00ff00) | (src & 0x0000ff) << 16;
 	// Switch nibble 0 and 1 in each byte
@@ -111,8 +110,7 @@ uint32_t switchByteOrder24(uint32_t src)
 	return src;
 }
 
-uint32_t setNextSync(uint32_t syncSample)
-{
+uint32_t setNextSync(uint32_t syncSample) {
 	if (syncSample == 0) {
 		return 0;
 	}
@@ -125,8 +123,7 @@ uint32_t setNextSync(uint32_t syncSample)
 	return nextSyncSample;
 }
 
-std::string getDeviceNameFromUser()
-{
+std::string getDeviceNameFromUser() {
 	char errbuf[PCAP_ERRBUF_SIZE] = {};
 	pcap_if_t* device = nullptr;
 	/* Retrieve the device list */
@@ -139,7 +136,7 @@ std::string getDeviceNameFromUser()
 	/* Print the list */
 	size_t interfaceIndex = 0;
 	for (device=alldevs; device; device=device->next) {
-		printf("%d. %s", ++interfaceIndex, device->name);
+		printf("%zu. %s", ++interfaceIndex, device->name);
 		if (device->description) {
 			printf(" (%s)\n", device->description);
 		} else {
@@ -148,17 +145,15 @@ std::string getDeviceNameFromUser()
 	}
 	size_t interfaceCount = interfaceIndex;
 
-	if (interfaceCount == 0)
-	{
+	if (interfaceCount == 0){
 		printf("\nNo interfaces found! Make sure WinPcap is installed.\n");
 		return "";
 	}
 
-	printf("Enter the interface number to capture from (1-%d):", interfaceCount);
-	scanf("%d", &interfaceIndex);
+	printf("Enter the interface number to capture from (1-%zu):", interfaceCount);
+	cin >> interfaceIndex;
 
-	if (interfaceIndex < 1 || interfaceIndex > interfaceCount)
-	{
+	if (interfaceIndex < 1 || interfaceIndex > interfaceCount){
 		printf("\nInterface number out of range.\n");
 		/* Free the device list */
 		pcap_freealldevs(alldevs);
@@ -174,14 +169,17 @@ std::string getDeviceNameFromUser()
 	return ret;
 }
 
-BOOL WINAPI AbortHandler(DWORD ctrlType)
-{
+void signalHandler(int signum) {
+	cout << "Interrupt signal (" << signum << ") received.\n";
 	g_doAbort = true;
-	return 1;
 }
 
-int main(int argc, char* argv[])
-{
+
+int main(int argc, char* argv[]) {
+	pthread_t thId = pthread_self();
+	pthread_attr_t thAttr;
+	int policy = 0;
+	int max_prio_for_policy = 0;
 	if (argc < 3) {
 		printf("Usage: %s [file.pcap] [out_file.raw]\n", argv[0]);
 		return -1;
@@ -195,16 +193,20 @@ int main(int argc, char* argv[])
 	/* Open the adapter */
 	char errbuf[PCAP_ERRBUF_SIZE] = {};
 	pcap_t* pcapHandle = nullptr;
-	if ((pcapHandle = pcap_open_live(deviceName.c_str(), 65536, 0, 1000, errbuf)) == nullptr)
-	{
+	if ((pcapHandle = pcap_open_live(deviceName.c_str(), 65536, 0, 1000, errbuf)) == nullptr) {
 		fprintf(stderr, "\nUnable to open the adapter. %s is not supported by WinPcap\n", deviceName.c_str());
 		return -1;
 	}
-	pcap_setbuff(pcapHandle, 1024*1024*20);
-	pcap_setmintocopy(pcapHandle, 1024*1024*5);
-	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+	pcap_set_buffer_size(pcapHandle, 1024*1024*20);
+	pcap_set_immediate_mode(pcapHandle, 1024*1024*5);
 
-	SetConsoleCtrlHandler(AbortHandler, TRUE);
+	pthread_attr_init(&thAttr);
+	pthread_attr_getschedpolicy(&thAttr, &policy);
+	max_prio_for_policy = sched_get_priority_max(policy);
+	// pthread_setschedprio(thId, max_prio_for_policy);
+	pthread_attr_destroy(&thAttr);
+	void (*prev_handler)(int);
+	prev_handler = std::signal(SIGINT, signalHandler);
 
 	/*FILE* inFile = fopen(argv[1], "rb");
 	if (!inFile) {
@@ -272,8 +274,9 @@ int main(int argc, char* argv[])
 			printf("%ld\n", firstPacketTime.tv_sec);
 		}
 		i++;
-		if (packetSize != 239 && packetSize != 235)
+		if (packetSize != 239 && packetSize != 235){
 			continue;
+		}
 		bool vlan = packetSize == 239;
 		char* currentSourceName = NULL;
 		size_t currentSourceId = 0;
@@ -283,13 +286,15 @@ int main(int argc, char* argv[])
 				currentSourceName = sourceNames[j];
 				currentSourceId = j;
 				break;
-			} else if (sourceList[j] == 0) {
+			}
+			else if (sourceList[j] == 0) {
 				sourceList[j] = destinationAddress;
-				sprintf(sourceNames[j], "%012I64x", destinationAddress);
+				sprintf(sourceNames[j], "%012llx", destinationAddress);
 				currentSourceName = sourceNames[j];
 				currentSourceId = j;
 				break;
-			} else {
+			}
+			else {
 			}
 		}
 		//printf("%s - %d\n", currentSourceName, currentSourceId);
@@ -311,7 +316,7 @@ int main(int argc, char* argv[])
 				dstSample = switchByteOrder24(srcSample);
 				if (channel == 0) {
 					if (dstSample != nextSync[currentSourceId] && nextSync[currentSourceId] != 0) {
-						fprintf(stderr, "Sync error in packet %I64d (%ld.%lds) (SyncData: %02x, Expected: %02x)\n", i, packetHeader->ts.tv_sec - firstPacketTime.tv_sec, packetHeader->ts.tv_usec,  dstSample, nextSync[currentSourceId]);
+						fprintf(stderr, "Sync error in packet %llu (%ld.%d) (SyncData: %02x, Expected: %02x)\n", i, packetHeader->ts.tv_sec - firstPacketTime.tv_sec, packetHeader->ts.tv_usec,  dstSample, nextSync[currentSourceId]);
 					}
 					nextSync[currentSourceId] = setNextSync(dstSample);
 				}
@@ -363,7 +368,7 @@ int main(int argc, char* argv[])
 		free(channelBuffers[i]);
 	}
 
-	printf("Done! %I64d packets processed\n", i);
+	printf("Done! %llu packets processed\n", i);
 	return 0;
 }
 
